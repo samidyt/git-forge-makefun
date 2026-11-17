@@ -1,0 +1,4 @@
+# Local verification evidence (runner output, transcripts). Kept in the build
+# directory for the report, not part of the submitted entry.
+poc/
+node_modules/

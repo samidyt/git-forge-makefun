@@ -1,0 +1,29 @@
+// respond.ts — tiny shared response helpers for the four surfaces.
+
+import type { ServerResponse } from 'node:http';
+
+export const JSON_TYPE = 'application/json; charset=utf-8';
+
+/** Answer with a JSON body. */
+export function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  const text = `${JSON.stringify(body)}\n`;
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
+  res.end(text);
+}
+
+/** Answer with raw bytes and an explicit content type. */
+export function sendBuffer(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  contentType: string,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, ...headers });
+  res.end(body);
+}

@@ -1,0 +1,14 @@
+{
+  "name": "git-forge-makefun",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A GitHub-compatible git forge: smart HTTP, REST v3, GraphQL and MCP over one in-memory store. Built by an AI agent for make.fun's \"Build a GitHub-compatible git forge\" bounty.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
