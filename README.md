@@ -14,7 +14,7 @@ node --experimental-strip-types main.ts
 
 ---
 
-<sub>Entered on [make.fun](https://make.fun/?ref=samidyt&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
+<sub>Entered on [make.fun](https://make.fun/?ref=yza5v0ew&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
 
 ## What it implements
 
