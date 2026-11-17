@@ -14,8 +14,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEFAULT_BRANCH,
   ZERO_OID,
+  cacheGitResponse,
   checkAuth,
   getRepo,
+  invalidateGitCache,
   isAncestor,
   listRefs,
   peelTag,
@@ -65,6 +67,9 @@ function parseGitPath(pathname: string): { owner: string; repo: string; rest: st
 
 /** A v0 ref advertisement: service preamble, HEAD + refs (peeled tags), capabilities on line one. */
 function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: Repo): Buffer {
+  const key = `ad0:${service}`;
+  const cached = repo.gitCache.get(key);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack' ? uploadV0Caps() : receiveCaps();
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const refs = listRefs(repo);
@@ -80,21 +85,23 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: 
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cacheGitResponse(repo, key, Buffer.concat(parts));
 }
 
-/** A protocol-v2 capability advertisement. */
+/** A protocol-v2 capability advertisement: constant, built once (no repo data in it). */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine(`agent=${AGENT}\n`),
+  PKT_FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 interface LsRefsOptions {
@@ -106,6 +113,9 @@ interface LsRefsOptions {
 
 /** A v2 ls-refs answer: HEAD (with symref-target), refs (with peeled: when asked), prefix-filtered. */
 function lsRefsResponse(repo: Repo, opts: LsRefsOptions): Buffer {
+  const key = `ls:${opts.peel ? 1 : 0}${opts.symrefs ? 1 : 0}${opts.unborn ? 1 : 0}:${opts.prefixes.join(',')}`;
+  const cached = repo.gitCache.get(key);
+  if (cached !== undefined) return cached;
   const lines: string[] = [];
   const keep = (name: string): boolean =>
     opts.prefixes.length === 0 || opts.prefixes.some((prefix) => name.startsWith(prefix));
@@ -124,7 +134,7 @@ function lsRefsResponse(repo: Repo, opts: LsRefsOptions): Buffer {
     }
     lines.push(`${line}\n`);
   }
-  return pktLines([...lines, 'flush']);
+  return cacheGitResponse(repo, key, pktLines([...lines, 'flush']));
 }
 
 interface FetchArgs {
@@ -138,6 +148,9 @@ interface FetchArgs {
  *  boundary moved on a depth request, then the packfile. A client that sent no haves expects
  *  no acknowledgments section at all (real git fails the fetch otherwise). */
 function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
+  const key = `f2:${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
+  const cached = repo.gitCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   if (args.haves.length > 0) {
@@ -162,11 +175,14 @@ function fetchV2Response(repo: Repo, args: FetchArgs): Buffer {
     parts.push(sidebandWrap(1, pack));
     parts.push(PKT_FLUSH);
   }
-  return Buffer.concat(parts);
+  return cacheGitResponse(repo, key, Buffer.concat(parts));
 }
 
 /** A v0 fetch answer: shallow/unshallow lines, an ACK (or NAK), then the pack in sideband band 1. */
 function fetchV0Response(repo: Repo, args: FetchArgs): Buffer {
+  const key = `f0:${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
+  const cached = repo.gitCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const lines: Array<string | 'flush'> = [];
   for (const oid of plan.shallow) lines.push(`shallow ${oid}\n`);
@@ -176,7 +192,7 @@ function fetchV0Response(repo: Repo, args: FetchArgs): Buffer {
   const parts: Buffer[] = [pktLines(lines)];
   if (plan.objects.length > 0) parts.push(sidebandWrap(1, writePack(plan.objects)));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return cacheGitResponse(repo, key, Buffer.concat(parts));
 }
 
 /** Handle POST git-upload-pack, protocol v2. */
@@ -348,6 +364,8 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
     repo.refs.set(command.ref, command.newOid);
     lines.push(`ok ${command.ref}\n`);
   }
+  // Objects and/or refs may have moved: drop every memoized git wire response.
+  invalidateGitCache(repo);
   // The report stream ends with its own flush INSIDE the sideband data: git's
   // report-status reader waits for that flush and reports "remote end hung up"
   // when the sideband stream ends without it. The outer flush (sideband case)

@@ -19,6 +19,7 @@ import {
   createIssue,
   createPull,
   gid,
+  invalidateIssueJson,
   issueGid,
   mergePull,
   parseGid,
@@ -586,6 +587,7 @@ const RESOLVERS: Readonly<Record<string, Resolver>> = Object.freeze({
     if (!subject || !('issue' in subject)) return null;
     subject.issue.state = 'closed';
     subject.issue.updatedAt = TRIAL_NOW_ISO;
+    invalidateIssueJson(subject.issue);
     return W('CloseIssuePayload', { repo: subject.repo, issue: subject.issue });
   },
   'Mutation.createPullRequest': (_parent, args, ctx) => {

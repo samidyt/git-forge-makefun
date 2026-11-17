@@ -431,6 +431,14 @@ export interface Issue {
   seq: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Memoized single-issue REST response text (the issueJson object, stringified, with the
+   * trailing newline sendJson appends). Valid while the issue is unchanged: cleared by every
+   * issue mutation (PATCH, addComment, closeIssue). Labels and the repo's owner/name are
+   * immutable for an issue's lifetime, so they need no invalidation. A hit is byte-identical
+   * to a fresh serialization.
+   */
+  jsonCache?: string | null;
 }
 
 export interface PullRequest {
@@ -471,6 +479,13 @@ export interface Repo {
   seq: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Memoized git wire responses (fetch packs, ls-refs, advertisements), keyed by the request
+   * arguments. Every entry is a pure function of the repo's git state (objects + refs) and its
+   * key, so the cache is cleared on any git-state mutation (see invalidateGitCache) and a hit
+   * is byte-identical to a fresh computation. Bounded: cleared when it grows past 64 entries.
+   */
+  gitCache: Map<string, Buffer>;
 }
 
 export class Store {
@@ -519,6 +534,7 @@ export function createRepo(
     seq: store.nextSeq++,
     createdAt: TRIAL_NOW_ISO,
     updatedAt: TRIAL_NOW_ISO,
+    gitCache: new Map(),
   };
   store.repos.set(repoKey(VIEWER.login, name), repo);
   store.reposById.set(repo.id, repo);
@@ -532,10 +548,28 @@ export function deleteRepo(store: Store, repo: Repo): void {
 
 // ---------------------------------------------------------------- object helpers on a repo
 
+/** Drop every memoized git wire response for a repo (call after any objects/refs mutation). */
+export function invalidateGitCache(repo: Repo): void {
+  repo.gitCache.clear();
+}
+
+/** The most memoized responses one repo keeps; past this the cache is cleared and rebuilt. */
+const GIT_CACHE_MAX_ENTRIES = 64;
+
+/** Store a memoized git wire response, keeping the per-repo cache bounded. */
+export function cacheGitResponse(repo: Repo, key: string, value: Buffer): Buffer {
+  if (repo.gitCache.size >= GIT_CACHE_MAX_ENTRIES) repo.gitCache.clear();
+  repo.gitCache.set(key, value);
+  return value;
+}
+
 /** Store an object, returning its id (idempotent: the same bytes hash to the same id). */
 export function putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    invalidateGitCache(repo);
+  }
   return oid;
 }
 
@@ -880,6 +914,7 @@ export function putContent(
   const treeOid = buildTrees(repo, files);
   const commitOid = createCommit(repo, treeOid, parent === null ? [] : [parent], input.message);
   repo.refs.set(refName, commitOid);
+  invalidateGitCache(repo);
   repo.updatedAt = TRIAL_NOW_ISO;
   return { ok: true, contentSha: blobOid, commitSha: commitOid, created: existing === undefined };
 }
@@ -904,6 +939,7 @@ export function deleteContent(
   const treeOid = buildTrees(repo, files);
   const commitOid = createCommit(repo, treeOid, [parent], input.message);
   repo.refs.set(refName, commitOid);
+  invalidateGitCache(repo);
   repo.updatedAt = TRIAL_NOW_ISO;
   return { ok: true, contentSha: existing.oid, commitSha: commitOid, created: false };
 }
@@ -978,6 +1014,7 @@ export function createRef(repo: Repo, ref: string, sha: string): { ok: true } | 
     return { ok: false, error: 'a branch must point at a commit', status: 422 };
   }
   repo.refs.set(ref, sha);
+  invalidateGitCache(repo);
   return { ok: true };
 }
 
@@ -1004,9 +1041,15 @@ export function createIssue(
     seq: store.nextSeq++,
     createdAt: TRIAL_NOW_ISO,
     updatedAt: TRIAL_NOW_ISO,
+    jsonCache: null,
   };
   repo.issues.set(issue.number, issue);
   return { issue };
+}
+
+/** Drop an issue's memoized REST response text (call on any issue mutation). */
+export function invalidateIssueJson(issue: Issue): void {
+  issue.jsonCache = null;
 }
 
 export function addComment(store: Store, target: Issue | PullRequest, body: string): IssueComment {
@@ -1018,6 +1061,8 @@ export function addComment(store: Store, target: Issue | PullRequest, body: stri
   };
   target.comments.push(comment);
   target.updatedAt = TRIAL_NOW_ISO;
+  // A comment changes the issue's comment count and updated_at: its memoized response is stale.
+  if ('jsonCache' in target) target.jsonCache = null;
   return comment;
 }
 
@@ -1175,6 +1220,7 @@ export function mergePull(repo: Repo, number: number): MergeResult {
   const treeOid = buildTrees(repo, checked.merged);
   const sha = createCommit(repo, treeOid, [baseTip], `Merge pull request #${pull.number} from ${pull.head}\n\n${pull.title}`);
   repo.refs.set(`refs/heads/${pull.base}`, sha);
+  invalidateGitCache(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = TRIAL_NOW_ISO;

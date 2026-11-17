@@ -22,6 +22,7 @@ import {
   deleteRepo,
   getContent,
   getRepo,
+  invalidateIssueJson,
   listBranches,
   listCommits,
   mergePull,
@@ -32,7 +33,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { sendJson } from './respond.ts';
+import { sendJson, sendPrebuiltJson } from './respond.ts';
 
 // ---------------------------------------------------------------- JSON shapes
 
@@ -80,6 +81,19 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     comments: issue.comments.length,
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/**
+ * The single-issue REST response text (issueJson, stringified, trailing newline included),
+ * memoized on the issue while it is unchanged. A hit is byte-identical to a fresh
+ * serialization; every issue mutation clears the memo (see invalidateIssueJson).
+ */
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const cached = issue.jsonCache;
+  if (cached !== null && cached !== undefined) return cached;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issue.jsonCache = text;
+  return text;
 }
 
 function refJson(repo: Repo, ref: string): { ref: string; sha: string; label: string; user: unknown; repo: unknown } {
@@ -579,7 +593,7 @@ export function handleRest(
           sendJson(res, created.status, { message: created.error });
           return true;
         }
-        sendJson(res, 201, issueJson(repo, created.issue));
+        sendPrebuiltJson(res, 201, issueJsonText(repo, created.issue));
         return true;
       }
       sendJson(res, 405, { message: 'Method Not Allowed' });
@@ -626,7 +640,7 @@ export function handleRest(
       }
       if (method === 'GET') {
         if (issue !== null) {
-          sendJson(res, 200, issueJson(repo, issue));
+          sendPrebuiltJson(res, 200, issueJsonText(repo, issue));
           return true;
         }
         // A pull request read as an issue, GitHub-style.
@@ -664,7 +678,12 @@ export function handleRest(
         const bodyText = asString(parsed.value.body);
         if (bodyText !== undefined) target.body = bodyText;
         target.updatedAt = TRIAL_NOW_ISO;
-        sendJson(res, 200, issue !== null ? issueJson(repo, issue) : pullJson(repo, pull!));
+        if (issue !== null) {
+          invalidateIssueJson(issue);
+          sendPrebuiltJson(res, 200, issueJsonText(repo, issue));
+          return true;
+        }
+        sendJson(res, 200, pullJson(repo, pull!));
         return true;
       }
       sendJson(res, 405, { message: 'Method Not Allowed' });

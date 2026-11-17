@@ -23,8 +23,24 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 /** The path and query of a request URL, or '/' when it does not parse (never a throw). */
 function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  // Fast path: a plain path with an optional query string (the only shape the suite sends).
+  // It returns the same pathname the URL parser would for a well-formed request, without the
+  // parse cost. Anything exotic (dot segments, backslashes, fragments, spaces, control
+  // characters) falls back to the URL parser below.
+  if (
+    raw.startsWith('/') &&
+    !raw.includes('..') &&
+    !raw.includes('\\') &&
+    !raw.includes('#') &&
+    !/[ \u0000-\u001f\u007f]/.test(raw)
+  ) {
+    const q = raw.indexOf('?');
+    if (q < 0) return { pathname: raw, query: new URLSearchParams() };
+    return { pathname: raw.slice(0, q), query: new URLSearchParams(raw.slice(q + 1)) };
+  }
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
     return { pathname: url.pathname, query: url.searchParams };
   } catch {
     return { pathname: '/', query: new URLSearchParams() };
@@ -65,7 +81,15 @@ export function createApp(): Server {
           sendJson(res, 200, { ok: true });
           return;
         }
-        const body = await readBody(req);
+        // GET/HEAD never carry a body in this API (GraphQL and MCP require POST; no GET
+        // handler reads one): when the request declares no body either, skip the body read
+        // entirely — one less async hop per request. A declared body is still consumed, so a
+        // keep-alive socket never stalls on unread bytes.
+        const hasBody =
+          req.headers['transfer-encoding'] !== undefined ||
+          (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
+        const body =
+          (method === 'GET' || method === 'HEAD') && !hasBody ? Buffer.alloc(0) : await readBody(req);
         if (handleRest(store, req, res, body, pathname, query)) return;
         if (handleGraphql(store, req, res, body, pathname)) return;
         if (handleMcp(store, req, res, body, pathname)) return;
