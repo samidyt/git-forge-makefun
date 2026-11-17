@@ -234,7 +234,31 @@ export function pktLines(items: ReadonlyArray<string | Buffer | 'flush' | 'delim
   return Buffer.concat(parts);
 }
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+/** The value of one hex digit, or -1 when the byte is not a hex digit. */
+function hexValue(byte: number): number {
+  if (byte >= 48 && byte <= 57) return byte - 48; // 0-9
+  if (byte >= 97 && byte <= 102) return byte - 87; // a-f
+  if (byte >= 65 && byte <= 70) return byte - 55; // A-F
+  return -1;
+}
+
+/**
+ * Parse a pkt-line length header (4 hex digits) at `offset`. Throws on a malformed
+ * header, with the same message the regex + parseInt it replaces produced — but without
+ * the subarray, the string, the regex or the parse on the hot path.
+ */
+function pktLineLength(buf: Buffer, offset: number): number {
+  const a = hexValue(buf[offset]!);
+  const b = hexValue(buf[offset + 1]!);
+  const c = hexValue(buf[offset + 2]!);
+  const d = hexValue(buf[offset + 3]!);
+  if ((a | b | c | d) < 0) {
+    throw new Error(
+      `invalid pkt-line length ${JSON.stringify(buf.subarray(offset, offset + 4).toString('ascii'))}`,
+    );
+  }
+  return (a << 12) | (b << 8) | (c << 4) | d;
+}
 
 /** Decode a whole buffer into packets; throws on any malformed or trailing byte. */
 export function decodePktLines(buf: Buffer): Packet[] {
@@ -248,9 +272,7 @@ function decodePktLinesUntilEnd(buf: Buffer): { packets: Packet[]; rest: Buffer 
   let offset = 0;
   while (offset < buf.length) {
     if (offset + 4 > buf.length) throw new Error('truncated pkt-line header');
-    const head = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const len = parseInt(head, 16);
+    const len = pktLineLength(buf, offset);
     if (len === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -280,9 +302,7 @@ export function decodePktLinesUntilFlush(buf: Buffer): { packets: Packet[]; rest
   let offset = 0;
   while (offset < buf.length) {
     if (offset + 4 > buf.length) throw new Error('truncated pkt-line header');
-    const head = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const len = parseInt(head, 16);
+    const len = pktLineLength(buf, offset);
     if (len === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -432,13 +452,14 @@ export interface Issue {
   createdAt: string;
   updatedAt: string;
   /**
-   * Memoized single-issue REST response text (the issueJson object, stringified, with the
-   * trailing newline sendJson appends). Valid while the issue is unchanged: cleared by every
-   * issue mutation (PATCH, addComment, closeIssue). Labels and the repo's owner/name are
-   * immutable for an issue's lifetime, so they need no invalidation. A hit is byte-identical
-   * to a fresh serialization.
+   * Memoized single-issue REST response bytes (the issueJson object, stringified, with the
+   * trailing newline sendJson appends, UTF-8 encoded once). Valid while the issue is
+   * unchanged: cleared by every issue mutation (PATCH, addComment, closeIssue). Labels and
+   * the repo's owner/name are immutable for an issue's lifetime, so they need no
+   * invalidation. A hit is byte-identical to a fresh serialization; memoizing the Buffer
+   * also skips the per-request UTF-8 encode and byte-length scan.
    */
-  jsonCache?: string | null;
+  jsonCache?: Buffer | null;
 }
 
 export interface PullRequest {

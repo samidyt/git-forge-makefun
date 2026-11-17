@@ -57,8 +57,9 @@ function parseGitPath(pathname: string): { owner: string; repo: string; rest: st
   let owner: string;
   let repo: string;
   try {
-    owner = decodeURIComponent(match[1]!);
-    repo = decodeURIComponent(match[2]!);
+    // decodeURIComponent is a no-op for a segment with no %-escape; skip the call.
+    owner = match[1]!.includes('%') ? decodeURIComponent(match[1]!) : match[1]!;
+    repo = match[2]!.includes('%') ? decodeURIComponent(match[2]!) : match[2]!;
   } catch {
     return null;
   }

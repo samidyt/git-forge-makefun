@@ -33,7 +33,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { sendJson, sendPrebuiltJson } from './respond.ts';
+import { JSON_TYPE, sendBuffer, sendJson } from './respond.ts';
 
 // ---------------------------------------------------------------- JSON shapes
 
@@ -84,16 +84,16 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
 }
 
 /**
- * The single-issue REST response text (issueJson, stringified, trailing newline included),
- * memoized on the issue while it is unchanged. A hit is byte-identical to a fresh
- * serialization; every issue mutation clears the memo (see invalidateIssueJson).
+ * The single-issue REST response bytes (issueJson, stringified, trailing newline included,
+ * UTF-8 encoded once), memoized on the issue while it is unchanged. A hit is byte-identical
+ * to a fresh serialization; every issue mutation clears the memo (see invalidateIssueJson).
  */
-function issueJsonText(repo: Repo, issue: Issue): string {
+function issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
   const cached = issue.jsonCache;
   if (cached !== null && cached !== undefined) return cached;
-  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
-  issue.jsonCache = text;
-  return text;
+  const buffer = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = buffer;
+  return buffer;
 }
 
 function refJson(repo: Repo, ref: string): { ref: string; sha: string; label: string; user: unknown; repo: unknown } {
@@ -151,6 +151,8 @@ function parseIdent(line: string): { name: string; email: string; date: string }
 // ---------------------------------------------------------------- helpers
 
 function decode(segment: string): string {
+  // decodeURIComponent is a no-op for a segment with no %-escape; skip the call.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -341,6 +343,138 @@ export function handleRest(
         deleteRepo(store, repo);
         res.writeHead(204);
         res.end();
+        return true;
+      }
+      sendJson(res, 405, { message: 'Method Not Allowed' });
+      return true;
+    }
+
+    // Issues — first: the timed read/write workloads hit this route, so it skips
+    // the branches/commits/refs/contents/labels checks below (all disjoint prefixes).
+    if (rest === '/issues') {
+      if (method === 'GET') {
+        const state = query.get('state') ?? 'open';
+        let issues = [...repo.issues.values()];
+        if (state === 'open') issues = issues.filter((issue) => issue.state === 'open');
+        else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
+        else if (state !== 'all') issues = issues.filter((issue) => issue.state === 'open');
+        const direction = query.get('direction') ?? 'desc';
+        issues.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
+        const { page, link } = paginate(issues, query, baseUrl);
+        sendJson(res, 200, page.map((issue) => issueJson(repo, issue)), link === null ? {} : { link });
+        return true;
+      }
+      if (method === 'POST') {
+        const parsed = parseBody(body);
+        if (!parsed.ok) {
+          sendJson(res, 400, { message: 'Invalid JSON body' });
+          return true;
+        }
+        const title = asString(parsed.value.title);
+        if (title === undefined || title === '') {
+          sendJson(res, 422, { message: 'title is required' });
+          return true;
+        }
+        const created = createIssue(store, repo, {
+          title,
+          body: asString(parsed.value.body) ?? '',
+          labels: asStringArray(parsed.value.labels) ?? [],
+        });
+        if ('error' in created) {
+          sendJson(res, created.status, { message: created.error });
+          return true;
+        }
+        sendBuffer(res, 201, issueJsonBuffer(repo, created.issue), JSON_TYPE);
+        return true;
+      }
+      sendJson(res, 405, { message: 'Method Not Allowed' });
+      return true;
+    }
+    const issueCommentsMatch = /^\/issues\/(\d+)\/comments$/.exec(rest);
+    if (issueCommentsMatch !== null) {
+      const number = Number(issueCommentsMatch[1]);
+      const target = repo.issues.get(number) ?? repo.pulls.get(number) ?? null;
+      if (target === null) {
+        notFound(res, 'Issue not found');
+        return true;
+      }
+      if (method === 'GET') {
+        sendJson(res, 200, target.comments.map(commentJson));
+        return true;
+      }
+      if (method === 'POST') {
+        const parsed = parseBody(body);
+        if (!parsed.ok) {
+          sendJson(res, 400, { message: 'Invalid JSON body' });
+          return true;
+        }
+        const commentBody = asString(parsed.value.body);
+        if (commentBody === undefined) {
+          sendJson(res, 422, { message: 'body is required' });
+          return true;
+        }
+        const comment = addComment(store, target, commentBody);
+        sendJson(res, 201, commentJson(comment));
+        return true;
+      }
+      sendJson(res, 405, { message: 'Method Not Allowed' });
+      return true;
+    }
+    const issueMatch = /^\/issues\/(\d+)$/.exec(rest);
+    if (issueMatch !== null) {
+      const number = Number(issueMatch[1]);
+      const issue = repo.issues.get(number) ?? null;
+      const pull = issue === null ? repo.pulls.get(number) ?? null : null;
+      if (issue === null && pull === null) {
+        notFound(res, 'Issue not found');
+        return true;
+      }
+      if (method === 'GET') {
+        if (issue !== null) {
+          sendBuffer(res, 200, issueJsonBuffer(repo, issue), JSON_TYPE);
+          return true;
+        }
+        // A pull request read as an issue, GitHub-style.
+        sendJson(res, 200, {
+          ...issueJson(repo, {
+            id: pull!.id,
+            number: pull!.number,
+            title: pull!.title,
+            body: pull!.body,
+            state: pull!.state,
+            labels: [],
+            comments: pull!.comments,
+            seq: pull!.seq,
+            createdAt: pull!.createdAt,
+            updatedAt: pull!.updatedAt,
+          }),
+          pull_request: {
+            url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull!.number}`,
+            html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull!.number}`,
+          },
+        });
+        return true;
+      }
+      if (method === 'PATCH') {
+        const parsed = parseBody(body);
+        if (!parsed.ok) {
+          sendJson(res, 400, { message: 'Invalid JSON body' });
+          return true;
+        }
+        const target = issue ?? pull!;
+        const state = asString(parsed.value.state);
+        if (state === 'open' || state === 'closed') target.state = state;
+        const title = asString(parsed.value.title);
+        if (title !== undefined) target.title = title;
+        const bodyText = asString(parsed.value.body);
+        if (bodyText !== undefined) target.body = bodyText;
+        target.updatedAt = TRIAL_NOW_ISO;
+        if (issue !== null) {
+          invalidateIssueJson(issue);
+          sendBuffer(res, 200, issueJsonBuffer(repo, issue), JSON_TYPE);
+          return true;
+        }
+        sendJson(res, 200, pullJson(repo, pull!));
         return true;
       }
       sendJson(res, 405, { message: 'Method Not Allowed' });
@@ -559,136 +693,6 @@ export function handleRest(
       return true;
     }
 
-    // Issues.
-    if (rest === '/issues') {
-      if (method === 'GET') {
-        const state = query.get('state') ?? 'open';
-        let issues = [...repo.issues.values()];
-        if (state === 'open') issues = issues.filter((issue) => issue.state === 'open');
-        else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
-        else if (state !== 'all') issues = issues.filter((issue) => issue.state === 'open');
-        const direction = query.get('direction') ?? 'desc';
-        issues.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
-        const { page, link } = paginate(issues, query, baseUrl);
-        sendJson(res, 200, page.map((issue) => issueJson(repo, issue)), link === null ? {} : { link });
-        return true;
-      }
-      if (method === 'POST') {
-        const parsed = parseBody(body);
-        if (!parsed.ok) {
-          sendJson(res, 400, { message: 'Invalid JSON body' });
-          return true;
-        }
-        const title = asString(parsed.value.title);
-        if (title === undefined || title === '') {
-          sendJson(res, 422, { message: 'title is required' });
-          return true;
-        }
-        const created = createIssue(store, repo, {
-          title,
-          body: asString(parsed.value.body) ?? '',
-          labels: asStringArray(parsed.value.labels) ?? [],
-        });
-        if ('error' in created) {
-          sendJson(res, created.status, { message: created.error });
-          return true;
-        }
-        sendPrebuiltJson(res, 201, issueJsonText(repo, created.issue));
-        return true;
-      }
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return true;
-    }
-    const issueCommentsMatch = /^\/issues\/(\d+)\/comments$/.exec(rest);
-    if (issueCommentsMatch !== null) {
-      const number = Number(issueCommentsMatch[1]);
-      const target = repo.issues.get(number) ?? repo.pulls.get(number) ?? null;
-      if (target === null) {
-        notFound(res, 'Issue not found');
-        return true;
-      }
-      if (method === 'GET') {
-        sendJson(res, 200, target.comments.map(commentJson));
-        return true;
-      }
-      if (method === 'POST') {
-        const parsed = parseBody(body);
-        if (!parsed.ok) {
-          sendJson(res, 400, { message: 'Invalid JSON body' });
-          return true;
-        }
-        const commentBody = asString(parsed.value.body);
-        if (commentBody === undefined) {
-          sendJson(res, 422, { message: 'body is required' });
-          return true;
-        }
-        const comment = addComment(store, target, commentBody);
-        sendJson(res, 201, commentJson(comment));
-        return true;
-      }
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return true;
-    }
-    const issueMatch = /^\/issues\/(\d+)$/.exec(rest);
-    if (issueMatch !== null) {
-      const number = Number(issueMatch[1]);
-      const issue = repo.issues.get(number) ?? null;
-      const pull = issue === null ? repo.pulls.get(number) ?? null : null;
-      if (issue === null && pull === null) {
-        notFound(res, 'Issue not found');
-        return true;
-      }
-      if (method === 'GET') {
-        if (issue !== null) {
-          sendPrebuiltJson(res, 200, issueJsonText(repo, issue));
-          return true;
-        }
-        // A pull request read as an issue, GitHub-style.
-        sendJson(res, 200, {
-          ...issueJson(repo, {
-            id: pull!.id,
-            number: pull!.number,
-            title: pull!.title,
-            body: pull!.body,
-            state: pull!.state,
-            labels: [],
-            comments: pull!.comments,
-            seq: pull!.seq,
-            createdAt: pull!.createdAt,
-            updatedAt: pull!.updatedAt,
-          }),
-          pull_request: {
-            url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull!.number}`,
-            html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull!.number}`,
-          },
-        });
-        return true;
-      }
-      if (method === 'PATCH') {
-        const parsed = parseBody(body);
-        if (!parsed.ok) {
-          sendJson(res, 400, { message: 'Invalid JSON body' });
-          return true;
-        }
-        const target = issue ?? pull!;
-        const state = asString(parsed.value.state);
-        if (state === 'open' || state === 'closed') target.state = state;
-        const title = asString(parsed.value.title);
-        if (title !== undefined) target.title = title;
-        const bodyText = asString(parsed.value.body);
-        if (bodyText !== undefined) target.body = bodyText;
-        target.updatedAt = TRIAL_NOW_ISO;
-        if (issue !== null) {
-          invalidateIssueJson(issue);
-          sendPrebuiltJson(res, 200, issueJsonText(repo, issue));
-          return true;
-        }
-        sendJson(res, 200, pullJson(repo, pull!));
-        return true;
-      }
-      sendJson(res, 405, { message: 'Method Not Allowed' });
-      return true;
-    }
 
     // Pull requests.
     if (rest === '/pulls') {

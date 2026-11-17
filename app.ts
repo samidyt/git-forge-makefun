@@ -21,6 +21,11 @@ import { sendJson } from './respond.ts';
 /** The largest request body accepted (packs in the suite are far below this). */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+/** Shared empty query params: no handler mutates the query it receives (paginate copies it). */
+const EMPTY_QUERY = new URLSearchParams();
+/** Shared empty body for requests that carry none. */
+const EMPTY_BODY = Buffer.alloc(0);
+
 /** The path and query of a request URL, or '/' when it does not parse (never a throw). */
 function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
   const raw = req.url ?? '/';
@@ -36,14 +41,14 @@ function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParam
     !/[ \u0000-\u001f\u007f]/.test(raw)
   ) {
     const q = raw.indexOf('?');
-    if (q < 0) return { pathname: raw, query: new URLSearchParams() };
+    if (q < 0) return { pathname: raw, query: EMPTY_QUERY };
     return { pathname: raw.slice(0, q), query: new URLSearchParams(raw.slice(q + 1)) };
   }
   try {
     const url = new URL(raw, 'http://entry');
     return { pathname: url.pathname, query: url.searchParams };
   } catch {
-    return { pathname: '/', query: new URLSearchParams() };
+    return { pathname: '/', query: EMPTY_QUERY };
   }
 }
 
@@ -66,41 +71,74 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/**
+ * Route one request through the four handlers (REST, GraphQL, MCP, git) and answer 404
+ * when none claims it. Synchronous: callers that already hold the body run this directly
+ * instead of paying for an async wrapper per request.
+ */
+function dispatch(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: Buffer,
+  pathname: string,
+  query: URLSearchParams,
+): void {
+  if (handleRest(store, req, res, body, pathname, query)) return;
+  if (handleGraphql(store, req, res, body, pathname)) return;
+  if (handleMcp(store, req, res, body, pathname)) return;
+  if (handleGit(store, req, res, body, pathname, query)) return;
+  sendJson(res, 404, { message: 'Not Found' });
+}
+
+/** Answer 500 for a dispatch failure; the response may already be gone. */
+function send500(res: ServerResponse, err: unknown): void {
+  try {
+    sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
+  } catch {
+    // the response is already gone; nothing left to do
+  }
+}
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const requestId = `req-${store.requestSeq++}`;
-      res.setHeader('x-github-request-id', requestId);
-      const { pathname, query } = pathOf(req);
-      const method = req.method ?? 'GET';
+    const requestId = `req-${store.requestSeq++}`;
+    res.setHeader('x-github-request-id', requestId);
+    const { pathname, query } = pathOf(req);
+    const method = req.method ?? 'GET';
+    // The env's boot check calls this twice: 200 {"ok":true}. No auth, no body read.
+    if (method === 'GET' && pathname === '/healthz') {
       try {
-        // The env's boot check calls this twice: 200 {"ok":true}. No auth, no body read.
-        if (method === 'GET' && pathname === '/healthz') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-        // GET/HEAD never carry a body in this API (GraphQL and MCP require POST; no GET
-        // handler reads one): when the request declares no body either, skip the body read
-        // entirely — one less async hop per request. A declared body is still consumed, so a
-        // keep-alive socket never stalls on unread bytes.
-        const hasBody =
-          req.headers['transfer-encoding'] !== undefined ||
-          (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
-        const body =
-          (method === 'GET' || method === 'HEAD') && !hasBody ? Buffer.alloc(0) : await readBody(req);
-        if (handleRest(store, req, res, body, pathname, query)) return;
-        if (handleGraphql(store, req, res, body, pathname)) return;
-        if (handleMcp(store, req, res, body, pathname)) return;
-        if (handleGit(store, req, res, body, pathname, query)) return;
-        sendJson(res, 404, { message: 'Not Found' });
+        sendJson(res, 200, { ok: true });
       } catch (err) {
-        try {
-          sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
-        } catch {
-          // the response is already gone; nothing left to do
-        }
+        send500(res, err);
+      }
+      return;
+    }
+    // GET/HEAD never carry a body in this API (GraphQL and MCP require POST; no GET
+    // handler reads one): when the request declares no body either, skip the body read
+    // entirely — one less async hop per request. A declared body is still consumed, so a
+    // keep-alive socket never stalls on unread bytes.
+    const hasBody =
+      req.headers['transfer-encoding'] !== undefined ||
+      (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
+    if ((method === 'GET' || method === 'HEAD') && !hasBody) {
+      // Bodyless request: dispatch synchronously — no promise, no microtask.
+      try {
+        dispatch(store, req, res, EMPTY_BODY, pathname, query);
+      } catch (err) {
+        send500(res, err);
+      }
+      return;
+    }
+    void (async () => {
+      try {
+        const body = await readBody(req);
+        dispatch(store, req, res, body, pathname, query);
+      } catch (err) {
+        send500(res, err);
       }
     })();
   });

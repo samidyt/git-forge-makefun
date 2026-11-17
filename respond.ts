@@ -16,11 +16,6 @@ export function sendJson(
   res.end(text);
 }
 
-/** Answer with a pre-built JSON body (already stringified, with its trailing newline). */
-export function sendPrebuiltJson(res: ServerResponse, status: number, text: string): void {
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
 export function sendBuffer(
   res: ServerResponse,
   status: number,
